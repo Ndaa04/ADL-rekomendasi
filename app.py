@@ -1,136 +1,260 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import re
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
-import os
+from data_loader import load_and_preprocess_data
+from recommender import (
+    compute_content_similarity,
+    compute_collaborative_similarity,
+    get_hybrid_recommendations,
+)
+from utils import find_show_by_keyword
 
-# ==========================================
-# 1. DATA LOADER
-# ==========================================
+# ----------------------------------------------
+# Caching
+# ----------------------------------------------
 @st.cache_data
-def load_and_preprocess_data(filepath: str = "top_rated_tv.csv") -> pd.DataFrame:
-    if not os.path.exists(filepath):
-        st.error(f"File '{filepath}' tidak ditemukan. Pastikan dataset berada di folder yang sama.")
-        st.stop()
-        
-    df = pd.read_csv(filepath)
-    df = df.dropna(subset=["name"])
-    df["overview"] = df["overview"].fillna("")
-    
-    df["overview"] = (
-        df["overview"]
-        .str.lower()
-        .str.replace(r'[^\w\s]', '', regex=True)
-        .str.replace(r'\s+', ' ', regex=True)
-        .str.strip()
-    )
-    return df.reset_index(drop=True)
+def load_data():
+    return load_and_preprocess_data("top_rated_tv.csv")
 
-# ==========================================
-# 2. RECOMMENDER ENGINE
-# ==========================================
 @st.cache_resource
-def build_similarity_matrices(df: pd.DataFrame, max_features: int = 5000):
-    # Content-Based (TF-IDF)
-    tfidf = TfidfVectorizer(stop_words='english', max_features=max_features)
-    tfidf_matrix = tfidf.fit_transform(df["overview"])
-    cb_sim = cosine_similarity(tfidf_matrix)
-    
-    # Collaborative Filtering (Numeric Features)
-    features = df[["vote_average", "vote_count", "popularity"]].fillna(0)
-    scaler = MinMaxScaler()
-    features_scaled = scaler.fit_transform(features)
-    cf_sim = cosine_similarity(features_scaled)
-    
+def compute_similarities(df):
+    cb_sim = compute_content_similarity(df)
+    cf_sim = compute_collaborative_similarity(df)
     return cb_sim, cf_sim
 
-def get_hybrid_recommendations(df, cb_sim, cf_sim, show_name, cf_weight=0.2, cb_weight=0.8, top_n=10):
-    mask = df["name"].str.lower() == show_name.lower()
-    if not mask.any():
-        return None, f"Show '{show_name}' tidak ditemukan di dataset."
-        
-    idx = df.index[mask][0]
-    hybrid_sim = (cf_weight * cf_sim[idx]) + (cb_weight * cb_sim[idx])
-    
-    similar_indices = hybrid_sim.argsort()[::-1][1:top_n+1]
-    result = df.iloc[similar_indices][["name", "vote_average", "vote_count", "popularity"]].copy()
-    result["similarity_score"] = hybrid_sim[similar_indices]
-    return result.sort_values(by="similarity_score", ascending=False), None
+# ----------------------------------------------
+# Inisialisasi session state
+# ----------------------------------------------
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = "rekomendasi"
 
-# ==========================================
-# 3. UTILS
-# ==========================================
-def find_show_by_keyword(df, keyword, context_chars=100):
-    keyword_lower = keyword.lower()
-    mask = df['overview'].str.contains(keyword_lower, case=False, na=False)
-    results = df[mask].copy()
+# Rekomendasi
+if "sort_metric" not in st.session_state:
+    st.session_state.sort_metric = "similarity"
+if "recommendations" not in st.session_state:
+    st.session_state.recommendations = None
+if "show_name" not in st.session_state:
+    st.session_state.show_name = ""
 
-    if len(results) == 0:
-        return None, f"Kata '{keyword}' tidak ditemukan di overview manapun."
+# Pencarian keyword
+if "kw_results_raw" not in st.session_state:
+    st.session_state.kw_results_raw = None
+if "kw_display_count" not in st.session_state:
+    st.session_state.kw_display_count = 10
+if "kw_sort_metric" not in st.session_state:
+    st.session_state.kw_sort_metric = "rating"
+if "kw_last_search" not in st.session_state:
+    st.session_state.kw_last_search = ""
 
-    def highlight_context(text, kw, chars=context_chars):
-        idx = text.lower().find(kw)
-        if idx == -1: return text
-        start = max(0, idx - chars)
-        end = min(len(text), idx + len(kw) + chars)
-        return f"...{text[start:end]}..."
-
-    results['overview_snippet'] = results['overview'].apply(lambda x: highlight_context(x, keyword_lower))
-    return results[['name', 'overview_snippet', 'vote_average', 'vote_count']], None
-
-# ==========================================
-# 4. STREAMLIT UI
-# ==========================================
+# ----------------------------------------------
+# UI
+# ----------------------------------------------
 st.set_page_config(page_title="📺 TV Show Recommender", page_icon="📺", layout="wide")
 st.title("Sistem Rekomendasi TV Show (Hybrid)")
 st.caption("Item-Based CF + Content-Based (TF-IDF) | Weighted Hybrid")
 
-# Load Data & Compute Similarities (Cached)
-with st.spinner("Memuat dataset & membangun matriks kemiripan..."):
-    df = load_and_preprocess_data()
-    cb_sim, cf_sim = build_similarity_matrices(df)  # ✅ Pastikan baris ini tepat seperti ini
+df = load_data()
+cb_sim, cf_sim = compute_similarities(df)
 
-# Sidebar Controls
-st.sidebar.header("⚙️ Pengaturan Bobot")
-cf_w = st.sidebar.slider("Bobot Collaborative Filtering (CF)", 0.0, 1.0, 0.2, 0.1)
-cb_w = st.sidebar.slider("Bobot Content-Based Filtering (CB)", 0.0, 1.0, 0.8, 0.1)
-top_n = st.sidebar.slider("Jumlah Rekomendasi", 5, 20, 10)
+# ==================== TAB SWITCHER ====================
+col_tab1, col_tab2 = st.columns(2)
+with col_tab1:
+    if st.button(
+        "🎯 Rekomendasi",
+        use_container_width=True,
+        type="primary" if st.session_state.active_tab == "rekomendasi" else "secondary",
+    ):
+        st.session_state.active_tab = "rekomendasi"
+        st.rerun()
+with col_tab2:
+    if st.button(
+        "🔍 Pencarian Keyword",
+        use_container_width=True,
+        type="primary" if st.session_state.active_tab == "keyword" else "secondary",
+    ):
+        st.session_state.active_tab = "keyword"
+        st.rerun()
 
-# Normalize weights to sum = 1.0
-total_w = cf_w + cb_w
-cf_norm = cf_w / total_w if total_w > 0 else 0.5
-cb_norm = cb_w / total_w if total_w > 0 else 0.5
+st.divider()
 
-# Main UI
-tab1, tab2 = st.tabs(["🎯 Rekomendasi Berdasarkan Judul", "🔍 Pencarian Keyword"])
-
-with tab1:
-    show_options = sorted(df["name"].tolist())
-    selected_show = st.selectbox("Pilih TV Show:", show_options)
-    
-    if st.button("🚀 Generate Rekomendasi", type="primary", use_container_width=True):
-        result, error = get_hybrid_recommendations(df, cb_sim, cf_sim, selected_show, cf_norm, cb_norm, top_n)
-        if error:
-            st.error(error)
-        else:
-            st.success(f"✅ Top {top_n} rekomendasi untuk *{selected_show}*")
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.dataframe(result, use_container_width=True, hide_index=True)
-            with col2:
-                st.metric("Avg Rating", f"{result['vote_average'].mean():.2f}")
-                st.metric("Avg Popularity", f"{result['popularity'].mean():.1f}")
-            st.info(f"⚖️ Bobot aktif: CF {cf_norm:.0%} | CB {cb_norm:.0%}")
-
-with tab2:
-    keyword = st.text_input("Masukkan kata kunci (contoh: 'lawyer', 'space', 'family'):")
+# ==================== TAB REKOMENDASI ====================
+if st.session_state.active_tab == "rekomendasi":
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        keyword = st.text_input("Cari judul TV Show", "", placeholder="Ketik nama...")
+    all_shows = sorted(df["name"].tolist())
     if keyword:
-        results, error = find_show_by_keyword(df, keyword)
-        if error:
-            st.warning(error)
+        filtered_shows = [name for name in all_shows if keyword.lower() in name.lower()]
+    else:
+        filtered_shows = all_shows
+
+    with col2:
+        if not filtered_shows:
+            st.warning("Tidak ada show yang cocok.")
+            selected_show = None
         else:
-            st.success(f"🔍 Ditemukan `{len(results)}` show mengandung *'{keyword}'*")
-            st.dataframe(results, use_container_width=True, hide_index=True)
+            selected_show = st.selectbox("Pilih TV Show:", filtered_shows)
+
+    col_cf_label, col_slider, col_cb_label, col_num = st.columns([0.2, 2, 0.2, 1])
+    with col_cf_label:
+        st.markdown("<span style='font-weight:bold;'>CF</span>", unsafe_allow_html=True)
+    with col_slider:
+        cf_pct = st.slider("Bobot CF (%)", 0, 100, 20, label_visibility="collapsed")
+    with col_cb_label:
+        st.markdown("<span style='font-weight:bold;'>CB</span>", unsafe_allow_html=True)
+    with col_num:
+        top_n = st.number_input("Jumlah Rekomendasi", min_value=1, max_value=50, value=10)
+
+    cb_pct = 100 - cf_pct
+    cf_weight = cf_pct / 100.0
+    cb_weight = cb_pct / 100.0
+    st.caption(f"CF: **{cf_pct}%**  |  CB: **{cb_pct}%**")
+
+    if st.button("🚀 Generate Rekomendasi", type="primary", use_container_width=True):
+        if selected_show is None:
+            st.warning("Silakan pilih TV Show terlebih dahulu.")
+        else:
+            result, error = get_hybrid_recommendations(
+                df, cb_sim, cf_sim, selected_show, cf_weight, cb_weight, top_n
+            )
+            if error:
+                st.error(error)
+                st.session_state.recommendations = None
+            else:
+                result = result.copy()
+                result["popularity"] = result["vote_average"] * result["vote_count"]
+                st.session_state.recommendations = result
+                st.session_state.show_name = selected_show
+
+    if st.session_state.recommendations is not None:
+        recs = st.session_state.recommendations
+        show_name = st.session_state.show_name
+        st.success(f"✅ Top {len(recs)} rekomendasi untuk *{show_name}*")
+
+        st.write("**Urutkan berdasarkan:**")
+        cols_btn = st.columns(3)
+        metrics = [
+            ("rating", "Rating"),
+            ("similarity", "Similarity Score"),
+            ("popularity", "Popularity"),
+        ]
+        for col, (key, label) in zip(cols_btn, metrics):
+            btn_type = "primary" if st.session_state.sort_metric == key else "secondary"
+            if col.button(label, key=f"btn_{key}", use_container_width=True, type=btn_type):
+                st.session_state.sort_metric = key
+                st.rerun()
+
+        sort_key = st.session_state.sort_metric
+        if sort_key == "similarity":
+            recs_sorted = recs.sort_values("similarity_score", ascending=False)
+        elif sort_key == "rating":
+            recs_sorted = recs.sort_values("vote_average", ascending=False)
+        else:
+            recs_sorted = recs.sort_values("popularity", ascending=False)
+
+        for _, row in recs_sorted.iterrows():
+            with st.container():
+                st.subheader(row["name"])
+                col1, col2, col3 = st.columns(3)
+                col1.metric("⭐ Rating", f"{row['vote_average']:.1f}")
+                col2.metric("📊 Similarity", f"{row['similarity_score']:.3f}")
+                col3.metric("🔥 Popularity", f"{row['popularity']:.0f}")
+                overview = row["overview_raw"]
+                if len(overview) > 200:
+                    st.write(overview[:200] + "...")
+                    with st.expander("Selengkapnya"):
+                        st.write(overview)
+                else:
+                    st.write(overview)
+                st.divider()
+
+# ==================== TAB PENCARIAN KEYWORD ====================
+else:
+    st.subheader("🔍 Pencarian Kata Kunci di Overview")
+    search_kw = st.text_input(
+        "Masukkan kata kunci", placeholder="contoh: lawyer, space, family", key="search_kw"
+    )
+
+    # Reset kalau keyword berubah
+    if search_kw != st.session_state.kw_last_search:
+        st.session_state.kw_last_search = search_kw
+        st.session_state.kw_display_count = 10
+        st.session_state.kw_sort_metric = "rating"
+        if search_kw:
+            raw, error = find_show_by_keyword(df, search_kw)
+            if error:
+                st.warning(error)
+                st.session_state.kw_results_raw = None
+            else:
+                raw = raw.copy()
+                raw["popularity"] = raw["vote_average"] * raw["vote_count"]
+                st.session_state.kw_results_raw = raw
+        else:
+            st.session_state.kw_results_raw = None
+
+    # Tampilkan hasil jika ada data
+    if st.session_state.kw_results_raw is not None:
+        data = st.session_state.kw_results_raw
+        total = len(data)
+
+        # --- Sorting ---
+        st.write("**Urutkan berdasarkan:**")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                "Rating",
+                key="kw_sort_rating",
+                use_container_width=True,
+                type="primary" if st.session_state.kw_sort_metric == "rating" else "secondary",
+            ):
+                st.session_state.kw_sort_metric = "rating"
+                st.session_state.kw_display_count = 10
+                st.rerun()
+        with c2:
+            if st.button(
+                "Popularity",
+                key="kw_sort_pop",
+                use_container_width=True,
+                type="primary" if st.session_state.kw_sort_metric == "popularity" else "secondary",
+            ):
+                st.session_state.kw_sort_metric = "popularity"
+                st.session_state.kw_display_count = 10
+                st.rerun()
+
+        sorted_data = data.sort_values(
+            by="vote_average" if st.session_state.kw_sort_metric == "rating" else "popularity",
+            ascending=False,
+        )
+
+        # Ambil sebanyak display_count (max = total)
+        display_count = min(st.session_state.kw_display_count, total)
+        page_data = sorted_data.iloc[:display_count]
+
+        st.success(
+            f"Ditemukan **{total}** show — menampilkan **{display_count}** teratas"
+        )
+
+        # --- Hasil ---
+        for _, row in page_data.iterrows():
+            with st.container():
+                st.subheader(row["name"])
+                col1, col2 = st.columns(2)
+                col1.metric("⭐ Rating", f"{row['vote_average']:.1f}")
+                col2.metric("🔥 Popularity", f"{row['popularity']:.0f}")
+                snippet = row["overview_snippet"]
+                st.write(snippet)
+                if len(row["overview_raw"]) > len(snippet.replace("...", "")):
+                    with st.expander("Selengkapnya"):
+                        st.write(row["overview_raw"])
+                st.divider()
+
+        # --- Load More (hanya muncul kalau masih ada sisa) ---
+        if display_count < total:
+            remaining = total - display_count
+            if st.button(
+                f"📥 Tampilkan 10 lagi ({remaining} tersisa)",
+                use_container_width=True,
+            ):
+                st.session_state.kw_display_count += 10
+                st.rerun()
+        else:
+            st.info("✅ Semua hasil sudah ditampilkan.")
